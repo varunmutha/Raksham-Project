@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D IMU Trajectory</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #fff;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #hud {
+            position: fixed;
+            top: 14px;
+            left: 14px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.78);
+            color: #ff6600;
+            font: 12px/1.9 'Courier New', monospace;
+            padding: 10px 16px;
+            border-radius: 10px;
+            pointer-events: none;
+            min-width: 230px;
+        }
+
+        #hud span {
+            color: #fff;
+        }
+
+        #controls {
+            position: fixed;
+            bottom: 18px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            z-index: 10;
+        }
+
+        #controls button {
+            background: #ff6600;
+            color: #fff;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 20px;
+            font: 13px/1 sans-serif;
+            font-weight: 600;
+            cursor: pointer;
+            letter-spacing: 0.5px;
+            transition: background .15s;
+        }
+
+        #controls button:hover {
+            background: #cc5200;
+        }
+
+        #controls button.secondary {
+            background: rgba(255, 255, 255, 0.15);
+            border: 1.5px solid #ff6600;
+            color: #ff6600;
+        }
+
+        #controls button.secondary:hover {
+            background: rgba(255, 102, 0, 0.15);
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+
+<body>
+
+    <div id="hud">
+        📦 Packets:&nbsp;<span id="h-pkt">0</span><br>
+        📍 Trail pts:&nbsp;<span id="h-trail">0</span><br>
+        🔴 X:&nbsp;<span id="h-x">0.00</span><br>
+        🟢 Y:&nbsp;<span id="h-y">0.00</span><br>
+        🔵 Z:&nbsp;<span id="h-z">0.00</span><br>
+        📐 Baseline:&nbsp;<span id="h-base">waiting…</span>
+    </div>
+
+    <div id="controls">
+        <button class="secondary" onclick="resetTrajectory()">↺ Reset</button>
+        <button class="secondary" onclick="toggleAutoRotate()">⟳ Auto-Rotate</button>
+    </div>
+
+    <script>
+        // ─── CONFIG ─────────────────────────────────────────────────────────────────
+        const CFG = {
+            scaleFactor: 0.05,   // tune this: smaller = less drift, larger = more visible movement
+            maxPoints: 5000,   // max trail points kept in memory
+            lerpSpeed: 0.12,   // smoothing factor (0–1) for sphere visual follow
+            primaryColor: 0xff6600,
+            bgColor: 0xffffff,
+        };
+
+        // ─── STATE ───────────────────────────────────────────────────────────────────
+        let scene, camera, renderer, controls;
+        let markerSphere, trailLine;
+        let autoRotate = false;
+
+        // Persistent world position (never reset automatically)
+        let posX = 0, posY = 0, posZ = 0;
+
+        // Baseline established from first packet
+        let baselineAx = null, baselineAy = null, baselineAz = null;
+        let calibrated = false;
+
+        // Trail buffer (Float32Array — never reallocated)
+        const trailBuf = new Float32Array(CFG.maxPoints * 3);
+        let trailCount = 0;
+
+        // Smooth visual target
+        const targetPos = new THREE.Vector3(0, 0, 0);
+        const currentPos = new THREE.Vector3(0, 0, 0);
+
+        // Debug counters
+        let packetCount = 0;
+
+        // HUD elements
+        const hudPkt = document.getElementById('h-pkt');
+        const hudTrail = document.getElementById('h-trail');
+        const hudX = document.getElementById('h-x');
+        const hudY = document.getElementById('h-y');
+        const hudZ = document.getElementById('h-z');
+        const hudBase = document.getElementById('h-base');
+
+        // ─── initScene() ─────────────────────────────────────────────────────────────
+        function initScene() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(CFG.bgColor);
+            scene.fog = new THREE.FogExp2(0xffffff, 0.004); // subtle distance fade
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 5000);
+            camera.position.set(20, 20, 20);
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(innerWidth, innerHeight);
+            renderer.setPixelRatio(devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            // Controls
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.06;
+            controls.target.set(0, 0, 0);
+
+            // Lighting
+            scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+            const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+            dir.position.set(30, 60, 30);
+            scene.add(dir);
+
+            // Infinite world grid — large size, many divisions
+            const grid = new THREE.GridHelper(2000, 400, 0xcccccc, 0xdddddd);
+            grid.material.opacity = 0.5;
+            grid.material.transparent = true;
+            scene.add(grid);
+
+            // Axes helper
+            scene.add(new THREE.AxesHelper(15));
+
+            // Origin marker (fixed white sphere at 0,0,0)
+            const originSphere = new THREE.Mesh(
+                new THREE.SphereGeometry(0.25, 24, 24),
+                new THREE.MeshBasicMaterial({ color: 0x333333 })
+            );
+            scene.add(originSphere);
+
+            // Moving orange sphere
+            markerSphere = new THREE.Mesh(
+                new THREE.SphereGeometry(0.5, 32, 32),
+                new THREE.MeshStandardMaterial({
+                    color: CFG.primaryColor,
+                    emissive: CFG.primaryColor,
+                    emissiveIntensity: 0.45,
+                })
+            );
+            scene.add(markerSphere);
+
+            // Trail line (BufferGeometry — allocated ONCE, never recreated)
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(trailBuf, 3));
+            geo.setDrawRange(0, 0);
+
+            trailLine = new THREE.Line(geo,
+                new THREE.LineBasicMaterial({
+                    color: CFG.primaryColor,
+                    transparent: true,
+                    opacity: 0.75,
+                })
+            );
+            scene.add(trailLine);
+
+            // Resize handler
+            window.addEventListener('resize', () => {
+                camera.aspect = innerWidth / innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(innerWidth, innerHeight);
+            });
+
+            // Seed origin into trail
+            pushTrailPoint(0, 0, 0);
+        }
+
+        // ─── pushTrailPoint() ─────────────────────────────────────────────────────────
+        function pushTrailPoint(x, y, z) {
+            const arr = trailLine.geometry.attributes.position.array;
+
+            if (trailCount < CFG.maxPoints) {
+                const i = trailCount * 3;
+                arr[i] = x; arr[i + 1] = y; arr[i + 2] = z;
+                trailCount++;
+                trailLine.geometry.setDrawRange(0, trailCount);
+            } else {
+                // Slide buffer left by one point — O(n) but avoids new allocation
+                arr.copyWithin(0, 3, CFG.maxPoints * 3);
+                const last = (CFG.maxPoints - 1) * 3;
+                arr[last] = x; arr[last + 1] = y; arr[last + 2] = z;
+                trailLine.geometry.setDrawRange(0, CFG.maxPoints);
+            }
+            trailLine.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // ─── updateTrajectory() ───────────────────────────────────────────────────────
+        function updateTrajectory() {
+            // Update smooth visual position (lerp toward mathematical target)
+            currentPos.lerp(targetPos, CFG.lerpSpeed);
+            markerSphere.position.copy(currentPos);
+        }
+
+        // ─── handleNewData(ax, ay, az) ────────────────────────────────────────────────
+        window.handleNewData = function (ax, ay, az) {
+            // Parse & guard
+            const nAx = parseFloat(ax);
+            const nAy = parseFloat(ay);
+            const nAz = parseFloat(az);
+            if (isNaN(nAx) || isNaN(nAy) || isNaN(nAz)) {
+                console.warn('[IMU] Skipped NaN packet:', ax, ay, az);
+                return;
+            }
+
+            // ── FIRST PACKET: calibrate baseline ───────────────────────────────────────
+            if (!calibrated) {
+                baselineAx = nAx;
+                baselineAy = nAy;
+                baselineAz = nAz;
+                calibrated = true;
+                hudBase.textContent = `${nAx.toFixed(2)}, ${nAy.toFixed(2)}, ${nAz.toFixed(2)}`;
+                console.log(`[IMU] Baseline set: ax=${nAx}, ay=${nAy}, az=${nAz}`);
+                return; // first packet only sets baseline — don't move yet
+            }
+
+            // ── SUBSEQUENT PACKETS: delta from baseline ────────────────────────────────
+            const dx = nAx - baselineAx;
+            const dy = nAy - baselineAy;
+            const dz = nAz - baselineAz;
+
+            posX += dx * CFG.scaleFactor;
+            posY += dy * CFG.scaleFactor;
+            posZ += dz * CFG.scaleFactor;
+
+            // Update mathematical target — sphere will lerp toward this
+            targetPos.set(posX, posY, posZ);
+
+            // Append exact world position to trail (not lerped)
+            pushTrailPoint(posX, posY, posZ);
+
+            // Update debug counters
+            packetCount++;
+            hudPkt.textContent = packetCount;
+            hudTrail.textContent = trailCount;
+            hudX.textContent = posX.toFixed(3);
+            hudY.textContent = posY.toFixed(3);
+            hudZ.textContent = posZ.toFixed(3);
+
+            // Console debug every 100 packets
+            if (packetCount % 100 === 0) {
+                console.log(`[IMU] #${packetCount} | dx=${dx.toFixed(3)} dy=${dy.toFixed(3)} dz=${dz.toFixed(3)} | pos=(${posX.toFixed(2)},${posY.toFixed(2)},${posZ.toFixed(2)}) | trail=${trailCount}`);
+            }
+        };
+
+        // ─── animate() ───────────────────────────────────────────────────────────────
+        function animate() {
+            requestAnimationFrame(animate);
+            updateTrajectory();         // smooth visual follow
+            controls.autoRotate = autoRotate;
+            controls.autoRotateSpeed = 0.4;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // ─── UI HELPERS ──────────────────────────────────────────────────────────────
+        function resetTrajectory() {
+            posX = 0; posY = 0; posZ = 0;
+            targetPos.set(0, 0, 0);
+            currentPos.set(0, 0, 0);
+            baselineAx = null; baselineAy = null; baselineAz = null;
+            calibrated = false;
+            trailCount = 0;
+            trailBuf.fill(0);
+            trailLine.geometry.setDrawRange(0, 0);
+            trailLine.geometry.attributes.position.needsUpdate = true;
+            packetCount = 0;
+            hudPkt.textContent = '0';
+            hudTrail.textContent = '0';
+            hudBase.textContent = 'waiting…';
+            console.log('[IMU] Trajectory reset');
+        }
+
+        function toggleAutoRotate() {
+            autoRotate = !autoRotate;
+        }
+
+        // ─── BOOT ────────────────────────────────────────────────────────────────────
+        initScene();
+        animate();
+
+        // ─── SIMULATION (remove when wiring real data) ────────────────────────────────
+        // Simulates a device that starts stationary then drifts
+        let _t = 0;
+        let _r = 0;
+        setInterval(() => {
+            // First 10 packets: stationary (baseline phase)
+            if (packetCount < 5 && !calibrated) {
+                handleNewData(8.0, 0.1, -0.2);
+                return;
+            }
+            _t += 0.03;
+            _r += 0.002;
+            // Gradually expanding helix — clearly shows all 3 axes active
+            handleNewData(
+                8.0 + Math.sin(_t) * _r * 2,   // ax
+                0.1 + _r * 0.5,                 // ay (slow upward drift)
+                -0.2 + Math.cos(_t) * _r * 2   // az
+            );
+        }, 50);
+    </script>
+</body>
+
+</html>
